@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Apr  1 09:38:33 2020
+
+@author: Daniel Lloveras
+
+Defines functions for inverting a 2D EPV distribution to create a zonal jet and
+a meridional temperature gradient
+"""
+
+import numpy as np
+from numba import njit
+
+#%% Constants
+
+F0 = 1.0e-4  # Coriolis parameter, in s^-1
+G = 9.81  # gravitational acceleration, in m/s^2
+T0 = 300.  # reference potential temperature, in K
+P0 = 1.0e5  # reference pressure, in Pa
+CP = 1004.  # specific heat at constant pressure, in J/(K*kg)       
+CV = 717.  # specific heat at constant volume, in J/(K*kg)
+RD = 287.  # ideal gas constant for dry air, in J/(K*kg)
+GAMMA = CP/CV
+KAPPA = RD/CP
+
+#%% Grids
+
+@njit
+def y_grid(ly, ny_l, ny_h):
+    
+    dy_l = ly/(ny_l - 1)  # grid res in y for low-res run
+    ylvls_l = np.zeros(ny_l)  # low-res y grid values
+    for j in range(ny_l):
+        ylvls_l[j] = j*dy_l
+        
+    dy_h = ly/(ny_h - 1)  # grid res in y for high-res run
+    ylvls_h = np.zeros(ny_h)  # high-res y grid values
+    for j in range(ny_h):
+        ylvls_h[j] = j*dy_h
+        
+    return dy_l, ylvls_l, dy_h, ylvls_h
+
+@njit
+def pi_grid(pbot, pibot, pitop, npi_l, npi_h):
+    
+    dpi_l = (pibot - pitop)/(npi_l - 1)  # grid res in pi for low-res run
+    pilvls_l = np.zeros(npi_l)  # low-res pi grid values
+    p_pi_l = np.zeros(npi_l)
+    for k in range(npi_l):
+        pilvls_l[k] = pibot - k*dpi_l
+        p_pi_l[k] = pbot*(pilvls_l[k]/CP)**(1/KAPPA)
+        
+    dpi_h = (pibot - pitop)/(npi_h - 1)  # grid res in pi for high-res run  
+    pilvls_h = np.zeros(npi_h)  # high-res pi grid values
+    p_pi_h = np.zeros(npi_h)
+    for k in range(npi_h):
+        pilvls_h[k] = pibot - k*dpi_h
+        p_pi_h[k] = pbot*(pilvls_h[k]/CP)**(1/KAPPA)
+        
+    return dpi_l, pilvls_l, dpi_h, pilvls_h, p_pi_l, p_pi_h
+
+@njit
+def eta_grid(nz):
+    
+    znw = np.zeros(nz+1)  # staggered eta levels
+    for k in range(nz+1):
+        znw[k] = (np.exp(-2*k/float(nz)) - np.exp(-2))/(1 - np.exp(-2))
+
+    #znw = np.linspace(1,0,nz+1)
+    
+    znu = np.zeros(nz)  # unstaggered eta levels
+    for k in range(nz):
+        znu[k] = 0.5*(znw[k+1] + znw[k])
+        
+    return znw, znu
+
+#%% Interpolation functions
+
+### Increasing grid values
+@njit    
+def interp_increasing(x_in, x_out, y_in, n_in, n_out):
+    
+    y_out = np.zeros(n_out)
+    i_in = 0
+    for i in range(n_out):
+        while True:
+            if (x_out[i] >= x_in[i_in] and x_out[i] <= x_in[i_in+1]):
+                dx = x_out[i] - x_in[i_in]
+                dx_in = x_in[i_in+1] - x_in[i_in]
+                y_out[i] = y_in[i_in] + (y_in[i_in+1] - y_in[i_in])*dx/dx_in
+                
+                break
+            
+            else:
+                i_in = i_in+1
+                if (i_in > n_in-1):
+                    break
+                
+        else:
+            continue
+        
+        if (i_in > n_in-1):
+            break
+
+    return y_out
+
+### Decreasing grid values
+@njit    
+def interp_decreasing(x_in, x_out, y_in, n_in, n_out):
+    
+    y_out = np.zeros(n_out)
+    i_in = 0
+    for i in range(n_out):
+        while True:
+            if (x_out[i] <= x_in[i_in] and x_out[i] >= x_in[i_in+1]):
+                dx = x_out[i] - x_in[i_in]
+                dx_in = x_in[i_in+1] - x_in[i_in]
+                y_out[i] = y_in[i_in] + (y_in[i_in+1] - y_in[i_in])*dx/dx_in
+                
+                break
+            
+            else:
+                i_in = i_in+1
+                if (i_in > n_in-1):
+                    break
+                
+        else:
+            continue
+        
+        if (i_in > n_in-1):
+            break
+
+    return y_out
+
+#%% Theta at top of atmosphere
+    
+@njit
+def theta_top(ly, ny, dy, dyth, thtop, dth):
+
+    thtopline = np.zeros(ny)
+    for j in range(ny):
+        a2 = 1.5*(j*dy - ly/2.)/dyth
+        if (np.abs(a2) < np.pi/2.):
+            thtopline[j] = thtop + dth*np.sin(a2)
+        elif (a2 > np.pi/2.):
+            thtopline[j] = thtop + dth
+        else:
+            thtopline[j] = thtop - dth
+
+    return thtopline
+
+#%% Tropopause shape
+    
+@njit
+def trop_shape(ly, ny, dy, dytr, pim, dpitr):
+    
+    pitp = np.zeros(ny)
+    for j in range(ny):
+        a1 = 2.*(j*dy - ly/2.)/dytr
+        if (np.abs(a1) <= np.pi/2.):
+            pitp[j] = pim + dpitr*np.sin(a1)
+        elif (a1 > np.pi/2.):
+            pitp[j] = pim + dpitr
+        else:
+            pitp[j] = pim - dpitr
+    
+    return pitp
+    
+#%% PV distributions
+
+@njit
+def pv_ctss(pvt, pvs, dpipv, ny, npi, pibot, pitop, dpi, pitp):
+    
+    pv = np.zeros((npi,ny))
+    for j in range(ny):
+        for k in range(npi):
+            pilev = pibot - k*dpi
+            gamma_val = (pibot - pilev)/(pibot - pitp[j])
+            beta_val = (pitp[j] - pilev)/(pitp[j] - pitop)
+            if (pitp[j] > pilev):
+                gamma_val = 0.
+            else:
+                beta_val = 0.
+                
+            a = 1. + 3.0*(gamma_val**2.)
+            b = 1. + 5.0*(beta_val**2.)                   
+            pv[k,j] = (pvt*a + pvs*b)/2. + \
+                        (pvt*a - pvs*b)/2.*(np.tanh(2.*(pilev - pitp[j])/dpipv))
+      
+    return pv
+
+@njit
+def pv_2lpv(pvt, pvs, dpipv, ny, npi, pibot, pitop, dpi, pitp):
+    
+    pv = np.zeros((npi,ny))
+    for j in range(ny):
+        for k in range(npi):
+            pilev = pibot - k*dpi
+            gamma_val = (pibot - pilev)/(pibot - pitp[j])
+            beta_val = (pitp[j] - pilev)/(pitp[j] - pitop)                   
+            pv[k,j] = (pvt + pvs)/2. + \
+                        (pvt - pvs)/2.*(np.tanh(2.*(pilev - pitp[j])/dpipv))
+      
+    return pv
+
+#%% PV inversion
+    
+@njit
+def pv_inv(pv, f, ny, pibot, dy, npi, dpi, om):    
+
+    fct = ((dy*dpi)**2.)*F0*P0/(G*KAPPA*(CP**(1/KAPPA)))
+    for k in range(1,npi-1):
+        pilev = pibot - k*dpi
+        for j in range(1,ny-1):
+            b = -0.5*(f[k,j+1] + f[k,j-1] + f[k+1,j] + f[k-1,j] + (F0*dy)**2.)
+            c = 0.25*(-fct*pilev**(-(1 - (1/KAPPA)))*pv[k,j] \
+                - (1/16.)*((f[k+1,j+1] - f[k+1,j-1] - f[k-1,j+1] + f[k-1,j-1])**2.) \
+                + (f[k,j+1] + f[k,j-1])*(f[k+1,j] + f[k-1,j]) \
+                + ((F0*dy)**2.)*(f[k+1,j] + f[k-1,j]))
+            d = np.abs(b**2. - 4.*c)
+            r = 0.5*(-b - np.sqrt(d)) - f[k,j]
+            f[k,j] = f[k,j] + om*r
+    
+    return f
+
+#%% U, Theta, and PV computations
+    
+@njit
+def u_calc(f, ny, npi, dy):    
+
+    u = np.zeros((npi,ny))
+    for j in range(1,ny-1):
+        u[:,j] = -(1/F0)*(f[:,j+1] - f[:,j-1])/(2.*dy)   
+    
+    u[:,0] = -(1/F0)*(f[:,1] - f[:,0])/dy
+    u[:,ny-1] = -(1/F0)*(f[:,ny-1] - f[:,ny-2])/dy     
+
+    return u
+
+@njit
+def theta_calc(f, ny, npi, dpi):
+
+    theta = np.zeros((npi,ny))
+    for k in range(1,npi-1):
+        theta[k,:] = (f[k+1,:] - f[k-1,:])/(2.*dpi)
+
+    theta[0,:] = (f[1,:] - f[0,:])/dpi 
+    theta[npi-1,:] = (f[npi-1,:] - f[npi-2,:])/dpi        
+
+    return theta
+    
+@njit
+def pv_calc(f, ny, dy, npi, dpi, pibot):
+
+    pv_out = np.zeros((npi,ny))
+    for k in range(1,npi-1):
+        pilev = pibot - k*dpi
+        for j in range(1,ny-1):
+            pv_out[k,j] = (G*KAPPA*(CP**(1/KAPPA))/P0)*pilev**(1 - (1/KAPPA)) \
+                        *((F0*(f[k+1,j] - 2*f[k,j] + f[k-1,j])/(dpi**2.)) \
+                        - ((1/F0)*(1/(4*dy*dpi)**2.)*(f[k+1,j+1] - f[k+1,j-1] \
+                        - f[k-1,j+1] + f[k-1,j-1])**2) \
+                        + ((f[k,j+1] - 2*f[k,j] + f[k,j-1])/(F0*dy*dy)) \
+                        *((f[k+1,j] - 2*f[k,j] + f[k-1,j])/(dpi**2.)))
+                        
+    pv_out[0,:] = pv_out[1,:]
+    pv_out[npi-1,:] = pv_out[npi-2,:]
+    pv_out[:,0] = pv_out[:,1]
+    pv_out[:,ny-1] = pv_out[:,ny-2]
+    
+    return pv_out
+    
+#%% Iteration
+ 
+@njit    
+def solve_PV_inversion(ly, ny, dy, dytr, pim, dpitr, pvt, pvs, dpipv, npi, \
+                       pibot, pitop, dpi, dyth, thtop, dth, f, om, nit, pv_dist):
+    
+    ### Compute tropopause shape, PV distribution, and top theta
+    pitp = trop_shape(ly, ny, dy, dytr, pim, dpitr)
+    if pv_dist==1:
+        pv = pv_ctss(pvt, pvs, dpipv, ny, npi, pibot, pitop, dpi, pitp)
+    elif pv_dist==2:
+        pv = pv_2lpv(pvt, pvs, dpipv, ny, npi, pibot, pitop, dpi, pitp)
+    thtopline = theta_top(ly, ny, dy, dyth, thtop, dth)
+    
+    ### Run PV inversion iterations and apply boundary conditions
+    for i in range(nit):
+        f = pv_inv(pv, f, ny, pibot, dy, npi, dpi, om)
+        f[npi-1,:] = f[npi-2,:] + thtopline[:]*dpi
+        f[:,0] = f[:,1]
+        f[:,ny-1] = f[:,ny-2]
+
+    ### Compute u, theta, and PV given solution for phi
+    u = u_calc(f, ny, npi, dy)
+    theta = theta_calc(f, ny, npi, dpi)
+    pv_out = pv_calc(f, ny, dy, npi, dpi, pibot)
+    
+    return pv, f, u, theta, pv_out
+
+#%% Computations on eta levels
+ 
+@njit    
+def eta_calc(ny, nz, pbot, ptop, znu, npi, p_pi, u_pi, theta_pi, phi_pi):
+    
+    p = np.zeros((nz,ny))
+    theta_eta = np.zeros((nz,ny))
+    u_eta = np.zeros((nz,ny))
+
+    p_lev = znu*(pbot - ptop) + ptop
+    for j in range(ny):
+        p[:,j] = p_lev
+        theta_eta[:,j] = interp_decreasing(p_pi,p_lev,theta_pi[:,j],npi,nz)
+        u_eta[:,j] = interp_decreasing(p_pi,p_lev,u_pi[:,j],npi,nz)
+    
+    rho = P0*(p/P0)**(1/GAMMA)/(RD*theta_eta)
+    
+    theta_surf = np.zeros(ny)
+    theta_surf[:] = 1.5*theta_eta[0,:] - 0.5*theta_eta[1,:]
+    rho_surf = ((pbot/P0)**(1/GAMMA))*P0/(RD*theta_surf)
+
+    z = np.zeros((nz,ny))
+    z[0,:] = -(p[0,:] - pbot)/(0.5*(rho_surf + rho[0,:])*G)
+    for k in range(1,nz):
+        z[k,:] = z[k-1,:] - (p[k,:] - p[k-1,:])/(0.5*(rho[k-1,:] + rho[k,:])*G)
+    
+    N = np.zeros((nz-1,ny))
+    dtdz = np.zeros((nz-1,ny))
+    for k in range(1,nz-1):
+        dtdz[k,:] = (theta_eta[k+1,:] - theta_eta[k-1,:])/(z[k+1,:] - z[k-1,:])
+        N[k,:] = np.sqrt(G/theta_eta[k]*dtdz[k,:])
+    
+    dtdz[0,:] = dtdz[1,:]
+    N[0,:] = N[1,:]
+    
+    return p, theta_eta, u_eta, rho, z, dtdz, N
